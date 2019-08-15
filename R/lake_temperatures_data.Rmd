@@ -1,0 +1,1168 @@
+---
+title: "lake_temperatures_data"
+author: "bryan"
+date: "August 1, 2019"
+output: github_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(lubridate)
+library(here)
+library(sf)
+library(prism)
+library(readr)
+library(raster)
+library(mapview)
+library(knitr)
+# library(goatscape) #use source(here::here('R/gs_nlcd.r')) instead
+library(prism)
+library(elevatr)
+# library(goatscape)  # use: source(here::here('R/gs_nlcd.r'))
+library(RSQLite)
+library(readxl)
+
+options(stringsAsFactors=FALSE)
+options(prism.path = "L:/Public/Milstead_Lakes/prism")  # will be really big
+
+# create dir "data_local" for scratch files
+if(!dir.exists(here::here('data_local'))) dir.create(here::here('data_local'))
+
+# load functions
+source(here::here('R/gs_nlcd.r'))  # the goatscape gs_nlcd.r function
+
+```
+
+## Note
+* This is a modification of the a file with the same names in: https://github.com/willbmisled/photic_zone_temp
+
+## Introduction
+* The goal of this project is to compile all of the data necessary to model lake surface temperatures and make predictions for all lakes in NHDplus 
+* This file replaces two preliminary attempts:
+    * lake_temp_data.Rmd
+    * prism_big_data.Rmd
+* All data will be assembled and stored as a SQLite database (lake_temperatures.sqlite) 
+    * database too large to share on github.  Must be assembled with the code below.
+    * [SQLite tables and fields schema and data definitions] (https://github.com/willbmisled/photic_zone_temp/blob/master/data/lake_temperatures_sqlite.xlsx)
+* This document also makes a subset of the data available as a .csv file.  This file [nla_base.csv] includes just the data for NLA lakes (2007 & 2012) that will be used to build a random forest model to predict lake temperatures.  Data definitions are at the bottom of this document.
+
+## Data sources
+
+* **lmorpho**: [Jeff Hollister's Lake Morphometry database](https://edg.epa.gov/data/PUBLIC/ORD/NHEERL/LakeMorphometry.zip)
+* **nla**
+    - [NLA2007 Lake locations shapefile](https://www.epa.gov/sites/production/files/2017-10/national_lakepoly_withmetrics_20090929.zip)
+    - [NLA2012 Lake locations shapefile](https://www.epa.gov/sites/production/files/2017-10/nla_2012_sites_sampled.zip)
+    - [NLA2007 design file](https://www.epa.gov/sites/production/files/2014-01/nla2007_sampledlakeinformation_20091113.csv"))
+    - [NLA2012 design file ](https://www.epa.gov/sites/production/files/2016-12/nla2012_wide_siteinfo_08232016.csv)
+    - [NLA2007 profile data with lake temperatures by depth](https://www.epa.gov/sites/production/files/2013-09/nla2007_profile_20091008.csv) 
+    - [NLA2012 profile data with lake temperatures by depth](https://www.epa.gov/sites/production/files/2016-12/nla2012_wide_profile_08232016.csv)
+* **nlcd**: [2006 & 2011 NLCD percent impervious cover in a 3000m buffer around lake](https://www.mrlc.gov/index.php)
+* **prism**: [prism estimates of daily min & max temperatures for date range (sample_date - 30 days):(sample_date) by location](http://www.prism.oregonstate.edu/)
+
+## CRS info
+* prism: '+proj=longlat +datum=NAD83 +no_defs +ellps=GRS80 +towgs84=0,0,0'
+* centroids: '+proj=longlat +datum=NAD83 +no_defs +ellps=GRS80 +towgs84=0,0,0'
+* lmorhpho: "+proj=merc +a=6378137 +b=6378137 +lat_ts=0.0 +lon_0=0.0 +x_0=0.0 +y_0=0 +k=1.0 +units=m +nadgrids=@null +wktext +no_defs"
+* nlcd: "+proj=aea +lat_1=29.5 +lat_2=45.5 +lat_0=23 +lon_0=-96 +x_0=0 +y_0=0 +ellps=GRS80 +towgs84=0,0,0,0,0,0,0
++units=m +no_defs"
+    
+## Data steps
+
+* Download the tmean prism daily for May1-Sep 30 for years 1981:2018
+
+```{r get_prism, include=TRUE, echo=FALSE, eval= FALSE}
+# NOte this will take many hours
+
+for(i in 1981:2018) {
+# for(i in c(1981:2006, 2008:2011, 2013:2018)) {
+  min <- ymd(paste0(i, "05", "01"))
+  max <- ymd(paste0(i, "09", "30"))
+  print(paste(i, Sys.time()))
+  get_prism_dailys(type="tmean", minDate = min, maxDate = max, keepZip=FALSE)
+}}
+
+```
+
+* Lake Morphometry
+    - download, convert to a single sf file
+    - save as "lmorpho.rda"
+
+```{r get_morpho, include=TRUE, echo=FALSE, eval=FALSE} 
+#download existing lake morphometry
+if(!dir.exists(here::here("data_local/LakeMorphGdb.gdb"))){
+  temp <- tempfile()
+  download.file("https://edg.epa.gov/data/PUBLIC/ORD/NHEERL/LakeMorphometry.zip",temp)
+  unzip(temp, exdir = here::here('data_local'))
+  unlink(temp)
+}
+
+# get layers
+if(file.exists(here::here('data_local/lmorpho.rda'))) {
+  load(here::here('data_local/lmorpho.rda'))
+  } else {
+    lyrs <- sf::st_layers(here::here("data_local/LakeMorphGdb.gdb"))
+    lmorph <- purrr::map(lyrs$name, function(x) sf::read_sf(here::here("data_local/LakeMorphGdb.gdb/"), x))
+    lmorpho <- do.call(rbind, lmorph) 
+
+  # change nlaSITE_ID == "NA" to NA
+  dim(lmorpho) # 363314     19
+  table(is.na(lmorpho$nlaSITE_ID)) # FALSE 363314  
+  
+  lmorpho <- mutate(lmorpho, nlaSITE_ID = ifelse(nlaSITE_ID == "NA", NA, nlaSITE_ID))
+  table(is.na(lmorpho$nlaSITE_ID)) # FALSE =1151  TRUE = 362163 
+  
+  save(lmorpho, file = here::here('data_local/lmorpho.rda'))
+}
+```
+
+* add centroids (longitude and latitude) to lmorpho
+    * extract centroids from lmorpho
+    * transform to prism crs (+proj=longlat +datum=NAD83 +no_defs +ellps=GRS80 +towgs84=0,0,0)
+    * add as longitude and latitude
+    
+```{r centroids, include=TRUE, echo=FALSE, eval=FALSE} 
+# download the lmorpho data
+load(here::here('data_local/lmorpho.rda'))
+
+# get the centroids
+centroids <- st_centroid(lmorpho)
+
+# transform to prism CRS
+# +proj=longlat +datum=NAD83 +no_defs +ellps=GRS80 +towgs84=0,0,0 
+
+centroids <- st_transform(centroids, "+proj=longlat +datum=NAD83 +no_defs +ellps=GRS80 +towgs84=0,0,0")
+
+# add lat long and convert to data.frame
+xy <- as.data.frame(st_coordinates(centroids))
+names(xy) <- c('longitude', 'latitude')
+
+centroids <- as.data.frame(centroids) %>%
+    dplyr::select(-Shape) %>%
+    cbind(xy) 
+```   
+    
+* get the prism cellnums (the grid cells) for the centroids
+ 
+```{r cellnums, include=TRUE, echo=FALSE, eval=FALSE} 
+# get a prism raster 
+pf <- raster(ls_prism_data(absPath=T)[1, 2]) 
+
+# change values of grid cells to the cell number
+values(pf) <- 1:ncell(pf)
+
+# extract the cellnums from the rasters
+a <- extract(x = pf, y = centroids[ , c("longitude", "latitude")])
+    length(a) # 363314
+    length(unique(a)) # 144402
+
+# add cellnum to centroids
+centroids$cellnum <- a
+
+# save file
+save(centroids, file = here::here('data/centroids.rda'))
+```
+
+* write a function to extract the prism data
+    * each year will be separate file saved as data_local/meanYYYY.rds  with YYYY = year
+
+```{r func_prism, include=TRUE, echo=FALSE, eval=TRUE}
+# function to extract the values for all dates in a year
+pvals <- function(year) {
+# free up memory
+  gc()
+# get the dates
+  dates <- format(seq(ymd(paste0(year, "05", "01")), ymd(paste0(year, "09", "30")), by="days"), format="%Y%m%d")
+# get the prism file names
+  pfiles <- paste0('PRISM_tmean_stable_4kmD1_', dates, '_bil')
+# make a raster stack
+  pstack <- prism_stack(pfiles)
+# get the values for all cellnums
+  vals <- as.data.frame(getValues(pstack))
+# shorten names to dmmdd (e.g., d0501)
+  names(vals) <- paste0("d", substr(dates, 5, 8))
+# add cellnum (same as the rowname)
+  vals$cellnum <- as.numeric(rownames(vals)) 
+# add year
+  vals$year <- year
+# keep only cellnums (cnums) with lakes in them
+  vals <- left_join(cnums, vals) 
+# assign df names as meanYYYY (year from input)
+  fname <- paste0('mean', year)
+  assign(fname, vals)
+# save the file
+  outname <- paste0('data_local/', fname, '.rds')
+  saveRDS(object = get(fname), file = here::here(outname)) 
+}
+
+```
+
+* Extract the values from the prism rasters and add to the table tmeans_raw in lake_temperatures.sqlite
+
+```{r vals_prism, include=TRUE, echo=FALSE, eval=FALSE}
+# create a list of cellnums is available
+if(exists("cnums") == FALSE){
+  if(exists("centroids") == FALSE) load(here::here('data/centroids.rda'))
+  cnums <- data.frame(cellnum = unique(centroids$cellnum)) %>% # 144402      1
+    arrange(cellnum)
+}
+
+# loop to extract values (note a file for each year will be saved to /data/ but not stored in memory)
+for (i in c(1981:2017)) {
+  if(!file.exists(paste0('data_local/mean', i, '.rds'))) {
+    print(i)
+    print(Sys.time())
+    pvals(i)
+}}
+
+# combine all means into a single SQLite table
+
+# create or connect to the database
+  means <- dbConnect(RSQLite::SQLite(), "L:/Public/Milstead_Lakes/prism/lake_temperatures.sqlite")
+  
+  
+# append data to table means
+  for(i in c(1981:2017)) {
+  print(Sys.time())
+  print(i)
+  rds <- paste0('data_local/mean', i, '.rds')
+  a <- readRDS(here::here(rds))
+  dbWriteTable(means, "means", a, append = TRUE)
+  print(memory.size())
+  }
+  
+# let's rename table 'means' to 'tmeans_raw'
+dbListTables(means)
+dbExecute(means, 'ALTER TABLE means RENAME TO tmeans_raw')
+dbListFields(means, "tmeans_raw")
+
+# create indices for cellnum and year for table "tmeans_raw"
+means <- dbConnect(RSQLite::SQLite(), "L:/Public/Milstead_Lakes/prism/lake_temperatures.sqlite")
+dbExecute(means,"CREATE INDEX index_tmeans_raw_cnum ON tmeans_raw (cellnum)") 
+dbExecute(means,"CREATE INDEX index_tmeans_raw_year ON tmeans_raw (year)")
+dbDisconnect(means)
+  
+# close and save the database
+  dbDisconnect(means)
+```
+
+* calculate 3, 7, and 30 mean temps
+    * means calculated and added to the table tmeans in lake_temperatures.sqlite
+    * this takes a long time to eval = FALSE; change if you want to rerun
+
+```{r means_prism, include=TRUE, echo=FALSE, eval=FALSE}
+
+for(j in c(1983:2017)) { 
+# for(j in c(1981:1982)) {   
+  print(Sys.time())
+# load a year of data
+  start <- Sys.time()
+  print(j)
+  rds <- paste0('data_local/mean', j, '.rds')
+  tmean <- readRDS(here::here(rds))
+  
+# create dfs to hold the preliminary results
+  tmean3 <- tmean[ , -c(2:32)] 
+  tmean3[ , 2:123] <- NA
+  tmean7 <- tmean3
+  tmean30 <- tmean3
+  
+# create df of temps for day-1
+  tmean_dm1 <- tmean3
+  tmean_dm1[ ,2:123] <- tmean[ ,32:153]
+  
+# loop to calculate the 3, 7, and 30 day means 
+for(i in c(33:154)){
+  tmean3[ , i-31] <- apply(tmean[ ,(i-3):(i-1)], 1, mean)
+  tmean7[ , i-31] <- apply(tmean[ ,(i-7):(i-1)], 1, mean)
+  tmean30[ , i-31] <- apply(tmean[ ,(i-30):(i-1)], 1, mean)
+} 
+
+# convert to long format
+  tm <- gather(tmean[ , -c(2:32)], date, tmean, -cellnum, -year)
+  tm_dm1 <- gather(tmean_dm1, date, tmean_dm1, -cellnum, -year)
+  tm3 <- gather(tmean3, date, tmean, -cellnum, -year)
+  tm7 <- gather(tmean7, date, tmean, -cellnum, -year)
+  tm30 <- gather(tmean30, date, tmean, -cellnum, -year)
+
+# combine year and date
+  tm <- dplyr::mutate(tm, date = paste0(tm$year, substr(tm$date, 2, 5))) %>%
+    dplyr::select(-year)
+
+# add dm1 and 3, 7, and 30 day means
+  tm$tmean_dm1 <- tm_dm1$tmean_dm1
+  tm$tmean_avg3 <- tm3$tmean
+  tm$tmean_avg7 <- tm7$tmean
+  tm$tmean_avg30 <- tm30$tmean
+  
+# connect to the database
+  means <- dbConnect(RSQLite::SQLite(), "L:/Public/Milstead_Lakes/prism/lake_temperatures.sqlite")
+
+# append data to table tmeans
+  dbWriteTable(means, "tmeans", tm, append = TRUE)
+
+# QAQC
+  # dbListTables(means)
+  # dbGetQuery(means, 'SELECT Count(*) FROM tmeans') # 17617044 (after first upload)
+  # dim(tm) # 17617044        6
+  
+# close and save the database
+  dbDisconnect(means)
+  
+print(Sys.time() - start)
+}
+
+# create indices for cellnum and date for table "tmeans"
+means <- dbConnect(RSQLite::SQLite(), "L:/Public/Milstead_Lakes/prism/lake_temperatures.sqlite")
+dbExecute(means,"CREATE INDEX index_tmeans_cnum ON tmeans (cellnum)") 
+dbExecute(means,"CREATE INDEX index_tmeans_date ON tmeans (date)")
+dbDisconnect(means)
+
+# QAQC
+# check number of lines
+means <- dbConnect(RSQLite::SQLite(), "L:/Public/Milstead_Lakes/prism/lake_temperatures.sqlite")
+dbGetQuery(means, 'SELECT Count(*) FROM tmeans') # 17617044 * 37 = 651,830,628
+
+# check some of the means for a random cellnums and dates
+means <- dbConnect(RSQLite::SQLite(), "L:/Public/Milstead_Lakes/prism/lake_temperatures.sqlite")
+
+yr1 <- sample(1981:2017, 1)
+day1 <- sample(format(seq(ymd(paste0(yr1, "06", "01")), ymd(paste0(yr1, "09", "30")), by="days"), format="%m%d"), 1)
+date1 <- paste0(yr1, day1)
+
+mean1 <- dbGetQuery(means, paste0('SELECT * FROM tmeans WHERE cellnum = ', cn, ' AND date = ', date1))
+
+mean2 <- dbGetQuery(means, paste0('SELECT * FROM tmeans_raw WHERE cellnum = ', cn, ' AND year = ', yr1))
+
+dbDisconnect(means)
+
+i <- which(names(mean2) == paste0('d', day1))
+c(mean1$tmean == mean2[i],
+mean1$avg_3day_tmean == apply(mean2[ ,(i-2):i], 1, mean),
+mean1$avg_7day_tmean == apply(mean2[ ,(i-6):i], 1, mean),
+mean1$avg_30day_tmean == apply(mean2[ ,(i-29):i], 1, mean))
+##
+
+# 
+
+# qa qc repeat in excel for one year (use a subset of the cellnums) - results are the same
+  # sample 100 cellnums from mean1981
+mean2001 <- readRDS(here::here('data_local/mean2001.rds'))
+temp <- mean2001[sample(as.numeric(row.names(mean2001)), 100), ] %>%
+      arrange(cellnum)
+
+  #get the calculated means for the sampled cellnums
+means <- dbConnect(RSQLite::SQLite(), "L:/Public/Milstead_Lakes/prism/lake_temperatures.sqlite")
+
+aves <- dbGetQuery(means, paste0('SELECT * FROM tmeans WHERE date IN (20010601, 20010707, 20010930) AND
+                                 cellnum IN (', paste(temp$cellnum, collapse=", "), ')')) %>%
+        arrange(cellnum)
+dbDisconnect(means)
+
+  # write data to csv
+write.csv(temp, here::here('data_local/temp/tmean.csv'))
+write.csv(aves, here::here('data_local/temp/tmean_avg.csv'))
+
+  # calculate the means in excel and compare to the results above
+excel <- read.csv(here::here('data_local/temp/tmean_excel.csv'))
+all.equal(aves$cellnum, excel$cellnum) # TRUE
+all.equal(as.numeric(aves$date), excel$date) # TRUE
+all.equal(aves$tmean, excel$tmean) # TRUE
+all.equal(aves$tmean_dm1, excel$tmean_dm1) # TRUE
+all.equal(aves$tmean_avg3, excel$tmean_avg3) # TRUE
+all.equal(aves$tmean_avg7, excel$tmean_avg7) # TRUE
+all.equal(aves$tmean_avg30, excel$tmean_avg30) # TRUE
+
+
+```
+
+* get the elevations for the centroids
+
+```{r elevatr, include=TRUE, echo=FALSE, eval=FALSE}
+locations <- dplyr::select(centroids, longitude, latitude, COMID)
+
+prj <- "+proj=longlat +ellps=GRS80 +towgs84=0,0,0,0,0,0,0 +no_defs"
+start <- Sys.time()
+elev <- get_elev_point(locations, prj = prj, src = 'aws', z = 8)
+end <- Sys.time()
+end - start # 36.65486 mins
+
+dim(centroids) # 363314     21
+dim(elev) # 363314      3
+centroids <- left_join(centroids, elev@data)
+dim(centroids) # 363328     23
+
+a <- as.data.frame(table(elev$COMID))
+b <- dplyr::filter(a, Freq > 1)
+
+dplyr::filter(elev@data, COMID %in% b$Var1)
+
+# Why are there 14 extra points now?
+length(unique(centroids$COMID)) # 363307  This includes the seve
+
+saveRDS(object = elev, file = here::here('data/elevations.Rds')) 
+
+```
+
+* create the lakes table from lmorpho, centroids, and elevation
+* seven COMIDs removed because they were repeated and had slighly different data
+* select and rename fields
+
+```{r lakes, include=TRUE, echo=FALSE, eval=FALSE}
+# check centroids / morpho for repeated comids
+a <- as.data.frame(table(centroids$COMID))
+b <- dplyr::filter(a, Freq > 1)  # 7 comids are repeated
+
+lakes <- dplyr::filter(centroids, !COMID %in% b$Var1)
+dim(centroids) # 363314     21
+dim(lakes) # 363300     21; removed 7 centroids repeated 2 x each = 14 rows
+
+# add elevation data
+lakes <- left_join(lakes, elev@data) # 363300     23
+
+# select and rename
+lakes <- dplyr::select(lakes, cellnum, comid = COMID, longitude, latitude, 
+                        surface_area = SurfaceArea,
+                        shoreline_length = ShorelineLength,
+                        shoreline_dev = ShorelineDev,
+                        max_length = MaxLength, 
+                        max_width = MaxWidth,
+                        mean_width = MeanWidth,
+                        max_depth = MaxDepthCorrect,
+                        mean_depth = MeanDepthCorrect,
+                        volume = VolumeCorrect,
+                        elevation)
+
+# create or connect to the database
+  means <- dbConnect(RSQLite::SQLite(), "L:/Public/Milstead_Lakes/prism/lake_temperatures.sqlite")
+
+# add lakes to table lakes
+  dbWriteTable(means, "lakes", lakes, overwrite = TRUE)
+  
+# index table lakes
+  dbExecute(means,"CREATE INDEX index_lakes_cnum ON lakes (cellnum)") 
+  dbExecute(means,"CREATE INDEX index_lakes_comid ON lakes (comid)")
+
+# housekeeping  
+dbListTables(means)
+dbListFields(means, "lakes")
+
+# close and save the database
+  dbDisconnect(means)
+  
+# save an Rds copy of lakes
+  saveRDS(object = lakes, file = here::here('data/elevations.Rds'))
+
+```
+
+* NLA 
+    - download the nla2007 & nla2012 shapefiles
+    - transform to st_crs(lmorpho) 
+        -  EPSG: 3857
+        -  proj4string: "+proj=merc +a=6378137 +b=6378137 +lat_ts=0.0 +lon_0=0.0 +x_0=0.0 +y_0=0 +k=1.0 +units=m +nadgrids=@null +wktext +no_defs"
+    - use st_join to match the 2007 and 2012 lakes to lmorpho
+      - 54 nla07 lakes removed due to lack of 1:1 correspondence with lmorpho
+      - 7 nla12 lakes removed because they did not map to any lmorpho lakes
+      - 82 nla12 lakes removed due to lack of 1:1 correspondence with lmorpho
+    - rbind nla2007 and nla2012
+
+```{r get_nla_gis, include=TRUE, echo=FALSE, eval=FALSE} 
+
+# download nla07
+  if(!file.exists(here::here('data_local/National_LakePoly_withMetrics_20090929.shp'))) {
+    temp <- tempfile()
+    download.file("https://www.epa.gov/sites/production/files/2017-10/national_lakepoly_withmetrics_20090929.zip",temp)
+    unzip(temp, exdir = here::here('data_local'))
+    unlink(temp)
+  }
+  
+# download nla12
+  if(!file.exists(here::here('data_local/NLA2012_Sampled_Polys_20131217.shp'))) {
+    temp <- tempfile()
+    download.file("https://www.epa.gov/sites/production/files/2017-10/nla_2012_sites_sampled.zip",temp)
+    unzip(temp, exdir = here::here('data_local'))
+    unlink(temp)
+  }
+  
+# transform NLA shapefiles to st_crs(lmorpho)
+  nla07 <- st_read(here::here('data_local/National_LakePoly_withMetrics_20090929.shp')) %>%
+            st_transform(st_crs(lmorpho))  # dim = 1159    6
+  
+  nla12 <- st_read(here::here('data_local/NLA2012_Sampled_Polys_20131217.shp')) %>%
+            st_transform(st_crs(lmorpho))  # dim = 1269 153
+  
+# join nla to lmorpho
+  j07 <- st_join(nla07, lmorpho) %>%
+          dplyr::select(nla_id = SITEID, comid = COMID) %>%
+          mutate(year = 2007)
+          
+  j12 <- st_join(nla12, lmorpho) %>%
+          dplyr::select(nla_id = NLA12_ID, comid = COMID.y) %>%
+          mutate(year = 2012)
+  
+# convert joins to data.frames
+  st_geometry(j07) <- NULL
+  st_geometry(j12) <- NULL
+  
+# remove repeated comid's and and nla_ids; lakes without a 1:1 correspondence
+#2007
+  dim(nla07) # 1159    6
+  dim(j07) # 1186   3
+  table(is.na(j07$comid)) # FALSE = 1186
+  table(is.na(j07$nla_id)) # FALSE = 1186
+  
+  a <- as.data.frame(table(j07$comid))
+  bc <- filter(a, Freq > 1) # 4 lmorpho lakes map to multiple nla lakes map; delete these
+
+  a <- as.data.frame(table(j07$nla_id))
+  bs <- filter(a, Freq > 1) # 18 nla lakes map to multiple lmorpho lakes map; delete these
+  
+  j07 <- filter(j07, !comid %in% bc$Var1, !nla_id %in% bs$Var1) # 1132    3
+  
+#2012
+  dim(nla12) # 1269  153
+  dim(j12) # 1315    3
+  table(is.na(j12$comid)) # FALSE = 1308 TRUE = 7
+  table(is.na(j12$nla_id)) # FALSE = 1315
+  
+  j12 <- j12[!is.na(j12$comid), ] # 1308    3
+  
+  a <- as.data.frame(table(j12$comid))
+  bc <- filter(a, Freq > 1) # 2 lmorpho lakes map to multiple nla lakes map; delete these
+
+  a <- as.data.frame(table(j12$nla_id))
+  bs <- filter(a, Freq > 1) # 32 nla lakes map to multiple lmorpho lakes map; delete these
+  
+  j12 <- filter(j12, !comid %in% bc$Var1, !nla_id %in% bs$Var1) # 1226    3
+
+# rbind
+  nla_id <- rbind(j07, j12) # 2358    3
+  
+# save an Rds copy of lakes
+  saveRDS(object = nla_id, file = here::here('data/nla_id.Rds')) 
+  # nla_id <- readRDS(file = here::here('data/nla_id.Rds'))
+```
+
+* get the nla profile data
+* calc the mean temperature for top 2m by nla_id, date, and visit_no
+* join to nla_id to create table nla
+* no profile data for 12 nla07 and 160 nla12 lakes
+* 184 lakes sampled twice
+* 4 lakes sampled on visit_no == 2 only
+
+```{r nla_data, include=TRUE, echo=FALSE, eval=FALSE} 
+# get the profile data
+  p07 <- read.csv(url("https://www.epa.gov/sites/production/files/2013-09/nla2007_profile_20091008.csv")) %>% 
+    dplyr::select(nla_id = SITE_ID, visit_no = VISIT_NO, date = DATE_PROFILE, depth = DEPTH, 
+                  temperature = TEMP_FIELD) %>% 
+    dplyr::filter( !is.na(temperature)) %>%
+    dplyr::mutate(date = format(mdy(date), format="%Y%m%d")) # 12648     5
+
+   p12 <- read.csv(url("https://www.epa.gov/sites/production/files/2016-12/nla2012_wide_profile_08232016.csv")) %>%
+    filter(SAMPLE_TYPE == "PROF", SITE_ID != '', !is.na(DEPTH), !is.na(TEMPERATURE)) %>%
+    dplyr::select(nla_id = SITE_ID, visit_no = VISIT_NO, date = DATE_COL, depth = DEPTH, 
+                  temperature = TEMPERATURE) %>%
+    dplyr::mutate(date = format(dmy(date), format="%Y%m%d")) # 10967     5
+    
+#rbind p07 & p12  
+  prof <- rbind(p07, p12)
+  p2m <- dplyr::filter(prof, depth <= 2) # 9045    5
+  
+  tmean_2m <- group_by(p2m, nla_id, visit_no, date) %>% 
+    summarise(tmean_2m = mean(temperature), tmean_2m_n = n()) %>%
+    left_join(nla_id) %>%
+    dplyr::filter(!is.na(comid)) %>%
+    dplyr::select(nla_id, comid, year, date, visit_no, tmean_2m, tmean_2m_n) %>%
+    ungroup()
+
+# some lakes have missing profile data  
+  dim(tmean_2m) # 2370    7
+  length(unique(tmean_2m$nla_id)) # 2186
+  a <- filter(nla_id, !nla_id %in% tmean_2m$nla_id)
+  table(a$year) # 2007 = 12; 2012 = 160
+  
+# some lakes sampled twice
+  table(tmean_2m$visit_no) # 1 = 2182; 2 = 188
+  
+  a <- as.data.frame(table(tmean_2m$nla_id))
+  b <- filter(a, Freq > 1) # 184 2; so 4 lakes sampled on visit_no == 2 only
+ 
+# save tmean_2m
+        saveRDS(object = tmean_2m, file = here::here('data/tmean_2m.Rds'))
+```
+
+### nlcd impervious data
+* calculate impervious surface in a 3000m buffer  for lmorpho / NLA lakes
+    - use year = 2006 for the 2007 lakes
+    - use year = 2011 for the 2012 lakes
+* restrict to lakes in tmean_2m since these have water temperature data.
+* 3k buffer also used in the ecosphere paper: https://esajournals.onlinelibrary.wiley.com/doi/epdf/10.1002/ecs2.1321
+* The buffering failed for comid == 14489102 (nla_id == NLA06608-0243 & nla_id == NLA12_SD-101); for now this lake will be removed.
+* goatscape did not return data for 14 of the 2007 lakes and 2 of the 2012 lakes.  We could work on this further but it is easiest just to eliminate these.  
+* The percent overlap field shows what percent of the buffer is covered by NLCD.  For 2007 and 2012 1 and 2 lakes are not completely covered respectively.  Eliminate these. 
+* For QAQC percent impervious was calculated in ArcMap for a couple of lakes.  Results comparable.
+
+```{r imperv, include=TRUE, echo=FALSE, eval=FALSE} 
+if(!exists("tmean_2m")) tmean_2m <- readRDS(here::here('data/tmean_2m.Rds'))
+if(!exists("lmorpho")) load(here::here('data_local/lmorpho.rda'))
+
+#  albers projection used by nlcd
+crs_alb <- "+proj=aea +lat_1=29.5 +lat_2=45.5 +lat_0=23 +lon_0=-96 +x_0=0 +y_0=0 +ellps=GRS80 
+  +towgs84=0,0,0,0,0,0,0 +units=m +no_defs"
+   landscape<-sf::st_transform(landscape, crs_alb) #reproject to the Albers Equal Area Conic projection used by NLCD
+  
+  
+
+# get the comids for nla lakes from tmean_2m
+# remove comid == 14489102; it fails in the buffer step
+  ids <- dplyr::select(tmean_2m, nla_id, comid, year) %>%   # 2370    3
+          filter(comid != 14489102) %>%                     # 2367    3
+          distinct()                                        # 2184    3
+  
+  filter(ids, year == 2007) %>% dplyr::select(comid) %>% distinct() %>% dim() # 1119    1
+  filter(ids, year == 2012) %>% dplyr::select(comid) %>% distinct() %>% dim() # 1065    1; 1119 + 1065 = 2184
+  
+# get the % imperv
+# set up data.frame for results
+impervious <- data.frame(comid = as.numeric(rep(NA, length(ids$comid))),
+                    nla_id = as.character(rep(NA, length(ids$comid))),
+                    total_percent_impervious = as.numeric(rep(NA, length(ids$comid))),
+                    total_areaM2_impervious = as.numeric(rep(NA, length(ids$comid))),
+                    buf_area_m2 = as.numeric(rep(NA, length(ids$comid))),
+                    percent_overlap = as.numeric(rep(NA, length(ids$comid))))
+
+# loop to populate data.frame
+for(i in min(which(is.na(impervious))):length(ids$comid)) {
+  #for(i in min(which(is.na(impervious))):5) {
+start <- Sys.time()
+lago <- tryCatch(st_transform(filter(lmorpho, comid == ids$comid[i]), crs_alb), error = function(e) NA) 
+buf <- tryCatch(sf::st_difference(sf::st_buffer(lago, 3000), sf::st_geometry(lago)), error = function(e) NA) 
+imp <- tryCatch(gs_nlcd(buf, spatial = TRUE, year = ids$year[i]-1, dataset = "impervious"), 
+                error = function(e) NA)
+
+# harvest data
+impervious$comid[i] <- ids$comid[i]
+impervious$nla_id[i] <- ids$nla_id[i]
+
+if(!is.na(imp)[1]){
+  impervious$total_percent_impervious[i] <- imp$total_percent_impervious
+  impervious$total_areaM2_impervious[i] <- imp$total_areaM2_impervious
+  impervious$buf_area_m2[i] <- sum(imp$nlcd_freq$areaM2)
+  impervious$percent_overlap[i] <- imp$percent_overlap
+}
+
+plot(buf[1], main = paste0("i = ", i, " of ", nrow(ids), "; nla_id = ", ids$nla_id[i], "; end = ", 
+                           format(Sys.time(), "%H:%M:%OS"))) 
+print(i)
+print(Sys.time()-start)
+}
+
+# remove observations where is.na(total_percent_impervious) or percent_overlap < 100
+dim(impervious) # 2184    6
+impervious <- filter(impervious, !is.na(impervious$total_percent_impervious)) # 2168    6
+impervious <- filter(impervious, percent_overlap == 100) #  2168    6
+
+# save impervious
+    saveRDS(object = impervious, file = here::here('data/impervious.Rds'))
+    # impervious <- readRDS(file = here::here('data/impervious.Rds'))
+
+```
+
+* create table "nla"
+    * primary keys are nla_id & visit_no
+
+```{r tbl_nla, include=TRUE, echo=FALSE, eval=FALSE} 
+tmean_2m <- readRDS(file = here::here('data/tmean_2m.Rds')) # 2370 7
+# tmean_2m$date <- as.numeric(tmean_2m$date)
+
+impervious <- readRDS(file = here::here('data/impervious.Rds')) # 2168    6
+imp <- dplyr::select(impervious, nla_id, comid, 
+                                         percent_impervious = total_percent_impervious, 
+                                         area_impervious = total_areaM2_impervious, area_total = buf_area_m2)
+
+nla <- left_join(tmean_2m, imp) # 2370    10
+  dim(unique(dplyr::select(nla, nla_id, visit_no))) # 2370 2
+  
+# connect to the database
+  means <- dbConnect(RSQLite::SQLite(), "L:/Public/Milstead_Lakes/prism/lake_temperatures.sqlite")
+
+# add nla to table nla
+  dbWriteTable(means, "nla", nla, overwrite = TRUE)
+  
+# index table nla
+  dbExecute(means,"CREATE INDEX index_nla_comid ON nla (comid)") 
+      #  dbExecute(means,"DROP INDEX index_nla_comid")
+  dbExecute(means,"CREATE INDEX index_nlaid_comid ON nla (nla_id)")
+  
+# close and save the database
+  dbDisconnect(means)
+```
+
+### QAQC tmeans_raw: checked and ready to go
+* Use arcMap to extract the prism values for 1 date and compare to table tmean_raw
+    * open arcMap and add prism raster tmeans for 19920930 ('data_local/prism_qaqc.mxd')
+    * save table "lakes" as lakes.csv
+    * import into arcmap and save as lakes.shp
+    * use the extract multi point tools to add prism tmean to lakes.shp (.dbf)
+    * bring back into r and compare
+    * everything peachy: 
+      * median difference = 0.0000006
+      * max difference = 2.7 # checked this out and the lake is on the border of two grid cells
+* no data for 16 cellnums corresponding to 22 lakes 
+    * looked at these in arcmap and all are just outside the prism raster; no data
+
+```{r tm_raw, include=TRUE, echo=FALSE, eval=FALSE} 
+# create a shapefile from table "lakes"
+means <- dbConnect(RSQLite::SQLite(), "L:/Public/Milstead_Lakes/prism/lake_temperatures.sqlite")
+dbListFields(means, "tmeans_raw") 
+
+lakes <- dbGetQuery(means, 'SELECT lakes.* FROM "lakes"') # 363300     14
+  write.csv(lakes, file = here::here('data_local/lakes.csv'), row.names = FALSE)
+
+# import into arcmap and save as shapefile 'data_local/lakes.shp'
+# compare to tmeans_raw
+am <- read.csv(here::here('data_local/lakes.dbf.csv')) # 363300      5
+db <- dbGetQuery(means, 'SELECT cellnum, d0930 FROM "tmeans_raw" WHERE year = 1992') # 144402      2
+comp <- left_join(am, db) # 363300      6
+comp <- comp[complete.cases(comp), ] # 363278      6
+comp$dif <- abs(comp$d0930 - comp$tm19920930)
+comp <- arrange(comp, dif)
+summary(comp$dif)
+
+plot(comp$d0930, comp$tm19920930)
+
+# missing values
+table(is.na(db$cellnum)) # FALSE = 144402
+table(is.na(db$d0930)) # FALSE = 144386 TRUE = 16
+
+chk <- db$cellnum[which(is.na(db$d0930))]
+
+# close and save the database
+dbDisconnect(means)
+```
+
+### QAQC tmeans
+* A date chosen randomly
+* Get the raw prism data from table tmean_raw for the date and the 30 days prior for all cellnums
+* Re-calculate the values in table tmeans from the raw data for all cellnums
+* Compare the results to table tmeans
+    * Done several times - all values match
+* Re-extract the values for the date from the prism raster and compare
+    * Also done several times - all values match
+    * This also verifies the cellnum field in table 'lakes'
+
+```{r tm, include=TRUE, echo=FALSE, eval=FALSE} 
+# choose a random date
+means <- dbConnect(RSQLite::SQLite(), "L:/Public/Milstead_Lakes/prism/lake_temperatures.sqlite")
+dbListFields(means, "tmeans")
+
+# list of all dates
+dates <- dbGetQuery(means, 'SELECT DISTINCT date FROM "tmeans"') # 4514    1
+
+# choose a date at random 
+d <- sample(dates$date, 1)
+yr <- substr(d, 1, 4)
+fields <- c('cellnum', 'year', paste0("d", substr(format(seq(ymd(d)-30, ymd(d), by="days"), format="%Y%m%d"), 5, 8)))
+
+# get tmean_raw data for date
+tmr <- dbGetQuery(means, paste("SELECT * FROM 'tmeans_raw' WHERE year = ", yr))
+tmr <- tmr[ , fields] # 144402     33
+
+comp <- dplyr::select(tmr, cellnum)
+comp$date <- d
+comp$tmean <- tmr[ , fields[33]]
+comp$tmean_dm1 <- tmr[ , fields[32]]
+comp$tmean_avg3 <- apply(tmr[, 30:32], 1, mean)
+comp$tmean_avg7 <- apply(tmr[, 26:32], 1, mean)
+comp$tmean_avg30 <- apply(tmr[, 3:32], 1, mean)
+
+aves <- dbGetQuery(means, paste0("SELECT * FROM 'tmeans' WHERE date = ", d)) # 144402      7
+
+all.equal(comp$cellnum, aves$cellnum) # TRUE
+all.equal(comp$tmean, aves$tmean) # TRUE
+all.equal(comp$tmean_dm1, aves$tmean_dm1) # TRUE
+all.equal(comp$tmean_avg3, aves$tmean_avg3) # TRUE
+all.equal(comp$tmean_avg7, aves$tmean_avg7) # TRUE
+all.equal(comp$tmean_avg30, aves$tmean_avg30) # TRUE
+
+# check that the cellnum field in table "lakes" is correct
+# get the tmeans_raw data for the date
+tmrd <- dplyr::select(tmr, cellnum, paste0('d', substr(d, 5, 8)))
+
+# get the prism tmeans raster values for the date
+pr <- raster(grep(paste0("PRISM_tmean_stable_4kmD1_", d), ls_prism_data(absPath=T)[,2],value=T))
+prv <- data.frame(value = values(pr))
+prv$cellnum <- as.numeric(row.names(prv))
+
+# join and compare
+chk <- left_join(tmrd, prv)
+all.equal(chk[ ,2], chk[ ,3]) # TRUE
+
+# close and save the database
+dbDisconnect(means)
+```
+
+### QAQc impervious
+* repeat the impervious buffer clip in arcmap
+* join the nla to lmorpho and transform to nlcd crs
+* write nla lakes to 'data_local/nla.shp'
+* download 2011 % Dev. Imperv. CONUS: (https://www.mrlc.gov/data?f%5B0%5D=category%3Aurban%20imperviousness)
+* add nla.shp and NLCD imperv to arcmap ('data_local/nlcd_qaqc.mxd)
+* select nla 2012 lakes for visit_no == 2 
+* buffer with "buffer" tool 
+    * Distance = linear unit = 3000m
+    * Side type = Outside Only
+    * End Type = Round
+    * Method = Planar
+    * Dissolve Type = None
+    * save as: nla2012_visit2_buf3000
+* use the clip (Data Management) tool to clip 2011 nlcd raster to the buffer 
+    * input raster = nlcd imp 2011
+    * output extent = nla2012_visit2_buf3000
+    * Check Box: Use input Features for Clipping Geometry = Checked
+    * NoData = 255
+    * save as: nla12_v1_buf3000_imp.tif
+* use Zonal Statistics as Table to sumarize raster clip
+    * input ... zone data = nla2012_visit2_buf3000
+    * zone field = 'nla_id'
+    * nla12_v1_buf3000_imp.tif
+    * output table = nla12_v1_buf3000_imp.dbf
+* compare arcmap and nla.impervious values graphically - near perfect fit.  Small differences expected.
+
+```{r chk_imp, include=TRUE, echo=FALSE, eval=FALSE} 
+# get the nlcd crs
+a <- raster::raster(here::here('nlcd_data/cropped/buf_NLCD_2006_impervious.tif'))
+crs_nlcd <- as.character(raster::crs(a))
+
+# join nla and lmorpho
+load(here::here('data_local/lmorpho.rda'))
+  names(lmorpho)[1] <- 'comid'
+means <- dbConnect(RSQLite::SQLite(), "L:/Public/Milstead_Lakes/prism/lake_temperatures.sqlite")
+  nla <- dbGetQuery(means, 'SELECT nla.* FROM "nla"') # 2370    9
+        dbDisconnect(means)
+        
+names_nla <- names(nla)
+
+nla <- left_join(lmorpho, nla) %>%
+    dplyr::filter(!is.na(nla_id)) %>%
+    dplyr::select(names_nla) %>% # 2370   10
+    sf::st_transform(crs_nlcd)
+    
+# st_write(nla, here::here('data_local/nla.shp'), delete_layer = TRUE)
+
+# join nla & arcmap summary nla12_v1_buf3000_imp.dbf
+am12 <- foreign::read.dbf(here::here("data_local/nla12_v1_buf3000_imp.dbf"))
+chk_am12 <- left_join(am12, nla) %>% 
+          dplyr::select(nla_id, arc_per_imp = MEAN, percent_impervious, arc_area = AREA, area_total)
+
+# compare by plotting
+plot(chk_am12$arc_per_imp, chk_am12$percent_impervious)
+  abline(0, 1)
+  
+plot(chk_am12$arc_area, chk_am12$area_total)
+  abline(0, 1)
+```
+
+### QAQC leftovers
+* The database elevation compared to the nla design file elevations; excellent match
+* tmean_n recalculated in excel and compared to database; all.equal == TRUE
+
+```{r chk_nla, include=TRUE, echo=FALSE, eval=FALSE} 
+######### elevation
+# get the the [elevatr] elevations
+means <- dbConnect(RSQLite::SQLite(), "L:/Public/Milstead_Lakes/prism/lake_temperatures.sqlite")
+  nla <- dbGetQuery(means, 'SELECT nla.nla_id, lakes.elevation, tmean_2m, tmean_2m_n 
+                          FROM "nla" 
+                          INNER JOIN "lakes"
+                          ON nla.comid = lakes.comid
+                          WHERE nla.visit_no = 1') # 2182    4
+              dbDisconnect(means)
+
+# get the lake elevations from the design files
+n07 <- read.csv(
+    url("https://www.epa.gov/sites/production/files/2014-01/nla2007_sampledlakeinformation_20091113.csv")) 
+
+n07a <- filter(n07, VISIT_NO == 1) %>% 
+          dplyr::select(nla_id = SITE_ID, nla_elev = ELEV_PT)
+
+n12 <- read.csv(
+    url("https://www.epa.gov/sites/production/files/2016-12/nla2012_wide_siteinfo_08232016.csv"))
+
+n12a <- filter(n12, VISIT_NO == 1) %>% 
+          dplyr::select(nla_id = SITE_ID, nla_elev = ELEVATION)
+
+nla_elev <- rbind(n07a, n12a)
+
+# join elevation files
+elev <- left_join(nla, nla_elev)
+
+# plot to compare
+plot(elev$elevation, elev$nla_elev)
+  abline(0, 1, col = "red", lwd =3)
+  
+  
+######## tmean_2m
+  
+# get the profile data
+  p07 <- read.csv(url("https://www.epa.gov/sites/production/files/2013-09/nla2007_profile_20091008.csv")) %>% 
+    dplyr::select(nla_id = SITE_ID, visit_no = VISIT_NO, date = DATE_PROFILE, depth = DEPTH, 
+                  temperature = TEMP_FIELD) %>% 
+    dplyr::filter( !is.na(temperature)) %>%
+    dplyr::mutate(date = format(mdy(date), format="%Y%m%d")) # 12648     5
+
+   p12 <- read.csv(url("https://www.epa.gov/sites/production/files/2016-12/nla2012_wide_profile_08232016.csv")) %>%
+    filter(SAMPLE_TYPE == "PROF", SITE_ID != '', !is.na(DEPTH), !is.na(TEMPERATURE)) %>%
+    dplyr::select(nla_id = SITE_ID, visit_no = VISIT_NO, date = DATE_COL, depth = DEPTH, 
+                  temperature = TEMPERATURE) %>%
+    dplyr::mutate(date = format(dmy(date), format="%Y%m%d")) # 10967     5
+    
+# rbind p07 & p12  
+  prof <- rbind(p07, p12)
+  p2m <- dplyr::filter(prof, depth <= 2, visit_no == 1) # 8322    5
+  
+# write to csv
+  write.csv(p2m, here::here("data_local/ptm.csv"), row.names = FALSE)
+  
+# used excel pivot table to recalculate the means.  
+# compare to nla
+  
+excel <- read.csv(here::here("data_local/ptm.csv")) %>%
+  dplyr::select(nla_id = nla_id_sum, temp_mean, temp_n)
+
+tcomp <- inner_join(nla, excel)
+all.equal(tcomp$tmean_2m, tcomp$temp_mean)  # TRUE
+all.equal(tcomp$tmean_2m_n, tcomp$temp_n)  # TRUE
+```
+
+## Document database
+* create a table in the database of data definitions (data_def) from 'data/lake_temperatures.xlsx' 
+
+* summarize the database
+
+```{r doc_db, include=TRUE, echo=FALSE, eval= FALSE} 
+dd <- read_xlsx(here::here('data/lake_temperatures_sqlite.xlsx'), sheet = "data_defs") %>%
+  dplyr::select(-rmd)
+
+# add table data_def to the database
+means <- dbConnect(RSQLite::SQLite(), "L:/Public/Milstead_Lakes/prism/lake_temperatures.sqlite")
+dbWriteTable(means, "data_defs", dd, overwrite = TRUE)
+
+dbDisconnect(means)
+```
+
+* summarize the database
+
+```{r summarize, include=TRUE, echo=FALSE, eval= TRUE} 
+means <- dbConnect(RSQLite::SQLite(), "L:/Public/Milstead_Lakes/prism/lake_temperatures.sqlite")
+
+tables <- dbListTables(means)
+tables
+
+# data_defs
+  dd_f <- dbListFields(means, "data_defs")  # fields
+  dd_n <- dbGetQuery(means, 'SELECT Count(*) FROM data_defs') # 46 observations
+
+# lakes
+  l_f <- dbListFields(means, "lakes")  # fields
+  l_n <- 363300 #dbGetQuery(means, 'SELECT Count(*) FROM lakes') # 363300 observations
+  #dim(dbGetQuery(means, 'SELECT DISTINCT comid FROM lakes')) # 363300; primary key
+  
+# nla
+  n_f <- dbListFields(means, "nla")  # fields
+  n_n <- dbGetQuery(means, 'SELECT Count(*) FROM nla') # 2370 observations
+  # dim(dbGetQuery(means, 'SELECT DISTINCT nla_id, visit_no FROM nla')) # 2370; composite primary key
+
+# tmeans
+  tm_f <- dbListFields(means, "tmeans")  # fields
+  tm_n <- 651830628 # dbGetQuery(means, 'SELECT Count(*) FROM tmeans') # 651830628 (651.8 m) observations
+  # dim(dbGetQuery(means, 'SELECT DISTINCT cellnum FROM tmeans')) # 144402; composite primary key
+  # dim(dbGetQuery(means, 'SELECT DISTINCT date FROM tmeans')) # 4514; composite primary key
+    # NOTE:  144402 * 4514 = 651830628
+
+# tmeans_raw
+  tmr_f <- dbListFields(means, "tmeans_raw")  # fields
+  tmr_n <- 5342874 # dbGetQuery(means, 'SELECT Count(*) FROM tmeans_raw') # 5342874 (5.3 m) observations
+  # dim(dbGetQuery(means, 'SELECT DISTINCT cellnum FROM tmeans_raw')) # 144402; composite primary key
+  # dim(dbGetQuery(means, 'SELECT DISTINCT year FROM tmeans_raw')) # 37; composite primary key
+    # NOTE:  144402 * 37 = 5342874
+
+# close and save the database
+dbDisconnect(means)
+
+# database size
+#size <- paste(round(file.size(here::here('data_local/lake_temperatures.sqlite')) / 1073741824, 1), 'gb')
+```
+
+* The database (L:/Public/Milstead_Lakes/prism/lake_temperatures.sqlite) is too large (~100 gb) to keep on github.  It will have to be compiled by running the code chunks in this document.  It could be a lengthy and difficult task.
+
+* The database includes the 5 tables: "data_defs", "lakes", "nla", "tmeans", and "tmeans_raw" 
+
+#### Data definitions for table "data_defs"  
+* This table has the data definitions for all tables in [lake_temperatures.sqlite]
+* observations = 46 
+
+field	| 	description
+----------- | --------------------------------- 
+**table**|database table for data definitions
+**field**|field in database table for data definitions
+**source**|source of the data for the field
+**units**|units of measurement
+**indexed**|does a database index exist for the field
+**primary**|Is this field a primary field?  NA = no; primary = simple primary key; composite = primary key composed of 2 or more fields
+**description**|a general description of the field
+    
+#### Data definitions for table "lakes" 
+* This table has the morphometry and elevation for the lmorpho lakes
+* observations = 363,300
+
+field	| source | units | indexed |	primary |	description
+----------- | -----------	| ------- | ---- | ---- |	--------------------------------- 
+**cellnum**|prism|NA|YES||the grid cell number of the prism raster(s) for the lake
+**comid**|lmorpho|int|YES|primary|nhdplus comid from the lmorpho dataset
+**longitude**|lmorpho|dd|||longitude of lmorpho centroid. Transformed to prism crs =="+proj=longlat +datum=NAD83 +no_defs +ellps=GRS80 +towgs84=0,0,0"
+**latitude**|lmorpho|dd|||latitude of lmorpho centroid. Transformed to prism crs =="+proj=longlat +datum=NAD83 +no_defs +ellps=GRS80 +towgs84=0,0,0"
+**surface_area**|lmorpho|m2|||lake surface area
+**shoreline_length**|lmorpho|m |||length of lake shoreline
+**shoreline_dev**|lmorpho|NA|||shoreline development index
+**max_length**|lmorpho|m|||maximum length of the lake polygon
+**max_width**|lmorpho|m|||maximum width of the lake polygon
+**mean_width**|lmorpho|m|||mean width of the lake polygon
+**max_depth**|lmorpho|m|||estimated maximum depth of lake
+**mean_depth**|lmorpho|m|||estimated mean depth of lake
+**volume**|lmorpho|m3|||estimated volume depth of lake
+**elevation**|aws|m|||elevation of the lake
+
+#### Data definitions for table "nla" 
+* This table has the NLA water temperature and NLCD impervious data
+* observations = `r n_n` 
+
+field	| source | units | indexed |	primary |	description
+----------- | -----------	| ------- | ---- | ---- |	--------------------------------- 
+**nla_id**|nla|char|YES|composite|unique identifiers for the NLA lakes
+**comid**|lmorpho|int|YES||nhdplus comid from the lmorpho dataset
+**cellnum**|prism|NA|||the grid cell number of the prism raster(s) for the lake
+**year**|nla|YYYY|||sample year 2007 or 2012
+**date**|nla|YYYYMMDD|||date the profile temperatures were collected
+**visit_no**|nla|int||composite|All lakes were sampled once (visit_no = 1); some were sampled twice (visit_no = 2)
+**tmean_2m**|nla|degrees C|||mean water temperature for depth <= 2 m
+**tmean_2m_n**|nla|degrees C|||number of observations used to calculate tmean_2m
+**percent_impervious**|nlcd|percent|||percent impervious surface in a 3000m buffer around the lake (includes islands); only observations with 100% coverage kept (i.e., lakes with partial NLCD coverage such as border lakes are excluded)
+**area_impervious**|nlcd|m2|||m2 of impervious surface in a 3000m buffer around the lake (includes islands); only observations with 100% coverage kept (i.e., lakes with partial NLCD coverage such as border lakes are excluded)
+**area_total**|lmorpho|m2|||area of 3000 m buffer around the lmorpho lake
+
+#### Data definitions for table "tmeans" 
+* This table has the aggregated prism air temperature estimates
+* observations = `r tm_n` 
+* fields = `r tm_f`
+
+field	| source | units | indexed |	primary |	description
+----------- | -----------	| ------- | ---- | ---- |	--------------------------------- 
+**cellnum**|prism|NA|YES|composite|the grid cell number of the prism raster(s) for the lake
+**date**|prism|YYYYMMDD|YES|composite|date of the prism estimate
+**tmean**|prism|degrees C|||mean temperature on the date
+**tmean_dm1**|prism|degrees C|||mean temperature on the day prior to the date (date minus 1)
+**tmean_avg3**|prism|degrees C|||average of prism means for the 3 days prior to the date
+**tmean_avg7**|prism|degrees C|||average of prism means for the 7 days prior to the date
+**tmean_avg30**|prism|degrees C|||average of prism means for the 30 days prior to the date
+
+#### Data definitions for table "tmeans_raw" 
+* This table has the raw (by date) prism air temperature estimates
+* observations = `r tmr_n` 
+* fields = `r tmr_f`
+
+field	| source | units | indexed |	primary |	description
+----------- | -----------	| ------- | ---- | ---- |	--------------------------------- 
+**cellnum**|prism|NA|YES|composite|the grid cell number of the prism raster(s) for the lake
+**d0501:d0531**|prism|degrees C|||estimated mean temperature for dates May 1:May 31 by tmeans_raw.year
+**d0601:d0630**|prism|degrees C|||estimated mean temperature for dates June 1:June 30 by tmeans_raw.year
+**d0701:d0731**|prism|degrees C|||estimated mean temperature for dates July 1:July 31 by tmeans_raw.year
+**d0801:d0831**|prism|degrees C|||estimated mean temperature for dates August 1:August 31 by tmeans_raw.year
+**d0901:d0930**|prism|degrees C|||estimated mean temperature for dates September 1:September 30 by tmeans_raw.year
+**year**|prism|YYYY|YES|composite|year 1981 to 2017
+
+## Create a subset of the data for lake temperature model and save as nla_base.Rds
+
+# Set up Data
+* load nla data from "data_local/lake_temperatures.sqlite"
+* create nla_base with the 2007 and 2012 nla, prism, lmorpho & imperv data for random forest analysis
+
+```{r bdata, include=TRUE, echo=FALSE, eval = FALSE}
+# load the nla data from lake_temperatures.sqlite
+
+if(file.exists(here::here('data/nla_base.Rds'))) {
+  nla_base <- readRDS(here::here('data/nla_base.Rds')) 
+  } else {
+
+means <- dbConnect(RSQLite::SQLite(), "L:/Public/Milstead_Lakes/prism/lake_temperatures.sqlite")
+
+# get the nla_base data
+nla_base <- dbGetQuery(means, '
+  SELECT nla.nla_id, nla.comid, lakes.cellnum, nla.year, nla.date, nla.visit_no, 
+    nla.tmean_2m, nla.percent_impervious, lakes.longitude, lakes.latitude, lakes.surface_area, 
+    lakes.shoreline_length, lakes.shoreline_dev, lakes.max_length, lakes.max_depth, lakes.max_width, 
+    lakes.mean_width, lakes.elevation, lakes.mean_depth, lakes.volume
+  FROM nla INNER JOIN lakes ON nla.comid = lakes.comid')
+
+# add fields for tmeans
+nla_base$tmean <- NA
+nla_base$tmean_dm1 <- NA
+nla_base$tmean_avg3 <- NA
+nla_base$tmean_avg7 <- NA
+nla_base$tmean_avg30 <- NA
+
+
+for(i in min(which(is.na(nla_base$tmean))):nrow(nla_base)){
+  print(i)
+  print(Sys.time())
+tm <- dbGetQuery(means, paste0("SELECT * FROM 'tmeans' WHERE cellnum = ", nla_base$cellnum[i], 
+                         " AND date = ", nla_base$date[i]))
+
+if(nrow(tm) > 0) {
+  nla_base$tmean[i] <- tm$tmean
+  nla_base$tmean_dm1[i] <- tm$tmean_dm1
+  nla_base$tmean_avg3[i] <- tm$tmean_avg3
+  nla_base$tmean_avg7[i] <- tm$tmean_avg7
+  nla_base$tmean_avg30[i] <- tm$tmean_avg30
+}}
+
+
+dbDisconnect(means)
+
+saveRDS(nla_base, file = here::here('data/nla_base.Rds')) # 2370   25
+write.csv(nla_base, here::here('data/nla_base.csv'), row.names = FALSE)
+}
+```
+
+
+### data definitions for nla_base.Rds & nla_base.csv
+
+field	| source | units | indexed |	primary |	description
+----------- | -----------	| ------- | ---- | ---- |	--------------------------------- 
+**nla_id**|nla|char|YES|composite|unique identifiers for the NLA lakes
+**comid**|lmorpho|int|YES||nhdplus comid from the lmorpho dataset
+**cellnum**|prism|NA|||the grid cell number of the prism raster(s) for the lake
+**year**|nla|YYYY|||sample year 2007 or 2012
+**date**|nla|YYYYMMDD|||date the profile temperatures were collected
+**visit_no**|nla|int||composite|All lakes were sampled once (visit_no = 1); some were sampled twice (visit_no = 2)
+**tmean_2m**|nla|degrees C|||mean water temperature for depth <= 2 m
+**percent_impervious**|nlcd|percent|||percent impervious surface in a 3000m buffer around the lake (includes islands); only observations with 100% coverage kept (i.e., lakes with partial NLCD coverage such as border lakes are excluded)
+**longitude**|lmorpho|dd|||longitude of lmorpho centroid. Transformed to prism crs =="+proj=longlat +datum=NAD83 +no_defs +ellps=GRS80 +towgs84=0,0,0"
+**latitude**|lmorpho|dd|||latitude of lmorpho centroid. Transformed to prism crs =="+proj=longlat +datum=NAD83 +no_defs +ellps=GRS80 +towgs84=0,0,0"
+**surface_area**|lmorpho|m2|||lake surface area
+**shoreline_length**|lmorpho|m |||length of lake shoreline
+**shoreline_dev**|lmorpho|NA|||shoreline development index
+**max_length**|lmorpho|m|||maximum length of the lake polygon
+**max_depth**|lmorpho|m|||estimated maximum depth of lake
+**max_width**|lmorpho|m|||maximum width of the lake polygon
+**mean_width**|lmorpho|m|||mean width of the lake polygon
+**elevation**|aws|m|||elevation of the lake
+**mean_depth**|lmorpho|m|||estimated mean depth of lake
+**volume**|lmorpho|m3|||estimated volume depth of lake
+**tmean**|prism|degrees C|||mean temperature on the date
+**tmean_dm1**|prism|degrees C|||mean temperature on the day prior to the date (date minus 1)
+**tmean_avg3**|prism|degrees C|||average of prism means for the 3 days prior to the date
+**tmean_avg7**|prism|degrees C|||average of prism means for the 7 days prior to the date
+**tmean_avg30**|prism|degrees C|||average of prism means for the 30 days prior to the date
+
+

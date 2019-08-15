@@ -1,0 +1,17 @@
+base
+vctrs
+tidyverse
+ggplot2
+tibble
+tidyr
+readr
+purrr
+dplyr
+stringr
+forcats
+RSQLite
+randomForest
+lubridate
+ggridges
+tmap
+sf
